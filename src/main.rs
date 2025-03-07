@@ -78,6 +78,8 @@ fn main() {
         println!("Lava loan initiation failed. Retrying... ({i} of {MAX_RETRIES})");
     };
 
+    lava_loans_borrower_cli_repay(&mnemonic, &contract_id).expect("Failed to repay loan");
+
     println!("Contract ID: {:?}", contract_id);
 }
 
@@ -184,4 +186,24 @@ fn lava_loans_borrower_cli_borrow(mnemonic: &bip39::Mnemonic) -> Option<String> 
     // TODO: Figure out why we have to check stderr rather than stdout.
     re.captures(&String::from_utf8_lossy(&output.stderr))
         .map(|caps| caps.get(1).map(|m| m.as_str().to_string()))?
+}
+
+fn lava_loans_borrower_cli_repay(mnemonic: &bip39::Mnemonic, contract_id: &str) -> Result<(), ()> {
+    let output = Command::new("./loans-borrower-cli")
+        .env("MNEMONIC", mnemonic.to_string())
+        .arg("--testnet")
+        .arg("--disable-backup-contracts")
+        .arg("borrow")
+        .arg("repay")
+        .arg("--contract-id")
+        .arg(contract_id)
+        .stdout(Stdio::piped())
+        .output()
+        .expect("Failed to execute `loans-borrower-cli borrow` command");
+
+    if String::from_utf8_lossy(&output.stderr).contains("The collateral has been reclaimed!") {
+        Ok(())
+    } else {
+        Err(())
+    }
 }
