@@ -14,6 +14,8 @@ use solana_sdk::pubkey::Pubkey as SolanaPubkey;
 use solana_sdk::signature::Signature as SolanaSignature;
 use solana_sdk::signer::{SeedDerivable, Signer};
 
+const NETWORK: Network = Network::Testnet4;
+
 fn main() {
     let mut entropy = [0u8; 32];
     let mut rng = rand::rng();
@@ -23,25 +25,23 @@ fn main() {
 
     println!("Mnemonic: {}", mnemonic);
 
-    let network = Network::Testnet4;
-    let root_priv_key = Xpriv::new_master(network, &mnemonic.to_seed(""))
+    let root_priv_key = Xpriv::new_master(NETWORK, &mnemonic.to_seed(""))
         .expect("Failed to create root private key");
 
-    let derivation_path = "m/84'/1'/0'/0/0"
-        .parse::<DerivationPath>()
-        .expect("Invalid derivation path");
-    let secp = Secp256k1::new();
-    let child_priv_key = root_priv_key
-        .derive_priv(&secp, &derivation_path)
-        .expect("Failed to derive child private key");
-
-    let public_key = BtcPublicKey::from_private_key(
-        &secp,
-        &PrivateKey::new(child_priv_key.private_key, network),
+    let (_, btc_recv_pubkey) = derive_keypair(
+        root_priv_key,
+        NETWORK,
+        "m/84'/1'/0'/0/0"
+            .parse::<DerivationPath>()
+            .expect("Invalid derivation path"),
     );
-    let address = BtcAddress::p2wpkh(&bitcoin::CompressedPublicKey(public_key.inner), network);
 
-    let txid = get_mutinynet_btc(address, BtcAmount::from_sat(50000));
+    let btc_recv_address = BtcAddress::p2wpkh(
+        &bitcoin::CompressedPublicKey(btc_recv_pubkey.inner),
+        NETWORK,
+    );
+
+    let btc_recv_txid = get_mutinynet_btc(btc_recv_address, BtcAmount::from_sat(50000));
 
     let derivation_path =
         solana_sdk::derivation_path::DerivationPath::from_absolute_path_str("m/44'/501'/0'/0")
@@ -52,10 +52,10 @@ fn main() {
     )
     .expect("Failed to derive keypair");
 
-    let signature = get_test_lava_usd(keypair.pubkey());
+    let sol_recv_signature = get_test_lava_usd(keypair.pubkey());
 
-    println!("Transaction ID: {}", txid);
-    println!("Signature: {}", signature);
+    println!("Bitcoin Receive TxID: {}", btc_recv_txid);
+    println!("Solana Receive Signature: {}", sol_recv_signature);
 
     install_lava_loans_borrower_cli();
 
@@ -277,4 +277,20 @@ fn lava_loans_borrower_cli_get_contract(
     remove_file(&file_path).unwrap();
 
     value
+}
+
+fn derive_keypair(
+    root_priv_key: Xpriv,
+    network: Network,
+    derivation_path: DerivationPath,
+) -> (PrivateKey, BtcPublicKey) {
+    let secp = Secp256k1::new();
+    let child_priv_key = root_priv_key
+        .derive_priv(&secp, &derivation_path)
+        .expect("Failed to derive child private key");
+
+    let private_key = PrivateKey::new(child_priv_key.private_key, network);
+    let public_key = BtcPublicKey::from_private_key(&secp, &private_key);
+
+    (private_key, public_key)
 }
