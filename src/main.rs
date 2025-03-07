@@ -1,4 +1,6 @@
-use std::process::Stdio;
+use std::fs::{File, remove_file};
+use std::io::BufReader;
+use std::process::{Output, Stdio};
 use std::{process::Command, str::FromStr};
 
 use bitcoin::bip32::{DerivationPath, Xpriv};
@@ -78,9 +80,47 @@ fn main() {
         println!("Lava loan initiation failed. Retrying... ({i} of {MAX_RETRIES})");
     };
 
-    lava_loans_borrower_cli_repay(&mnemonic, &contract_id).expect("Failed to repay loan");
+    let mut i = 0;
+    loop {
+        if lava_loans_borrower_cli_repay(&mnemonic, &contract_id).is_ok() {
+            break;
+        }
+
+        i += 1;
+
+        if i > MAX_RETRIES {
+            panic!("Unable to repay lava loan after {MAX_RETRIES} retries");
+        }
+
+        println!("Lava loan repayment failed. Retrying... ({i} of {MAX_RETRIES})");
+    }
+
+    let closed_json_object = loop {
+        if let Some(closed_json) = lava_loans_borrower_cli_get_contract(&mnemonic, &contract_id)
+            .as_object()
+            .unwrap()
+            .get("Closed")
+        {
+            break closed_json.as_object().unwrap().clone();
+        }
+    };
+
+    let collateral_repayment_txid = closed_json_object
+        .get("outcome")
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .get("repayment")
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .get("collateral_repayment_txid")
+        .unwrap()
+        .as_str()
+        .unwrap();
 
     println!("Contract ID: {:?}", contract_id);
+    println!("Collateral Repayment TxID: {:?}", collateral_repayment_txid);
 }
 
 fn get_mutinynet_btc(address: BtcAddress, amount: BtcAmount) -> BtcTxid {
@@ -188,7 +228,10 @@ fn lava_loans_borrower_cli_borrow(mnemonic: &bip39::Mnemonic) -> Option<String> 
         .map(|caps| caps.get(1).map(|m| m.as_str().to_string()))?
 }
 
-fn lava_loans_borrower_cli_repay(mnemonic: &bip39::Mnemonic, contract_id: &str) -> Result<(), ()> {
+fn lava_loans_borrower_cli_repay(
+    mnemonic: &bip39::Mnemonic,
+    contract_id: &str,
+) -> Result<(), Output> {
     let output = Command::new("./loans-borrower-cli")
         .env("MNEMONIC", mnemonic.to_string())
         .arg("--testnet")
@@ -204,6 +247,34 @@ fn lava_loans_borrower_cli_repay(mnemonic: &bip39::Mnemonic, contract_id: &str) 
     if String::from_utf8_lossy(&output.stderr).contains("The collateral has been reclaimed!") {
         Ok(())
     } else {
-        Err(())
+        Err(output)
     }
+}
+
+fn lava_loans_borrower_cli_get_contract(
+    mnemonic: &bip39::Mnemonic,
+    contract_id: &str,
+) -> serde_json::Value {
+    let file_path = format!("./{contract_id}.json");
+
+    Command::new("./loans-borrower-cli")
+        .env("MNEMONIC", mnemonic.to_string())
+        .arg("--testnet")
+        .arg("--disable-backup-contracts")
+        .arg("get-contract")
+        .arg("--contract-id")
+        .arg(contract_id)
+        .arg("--verbose")
+        .arg("--output-file")
+        .arg(&file_path)
+        .stdout(Stdio::piped())
+        .output()
+        .expect("Failed to execute `loans-borrower-cli borrow` command");
+
+    let file = File::open(&file_path).expect("Failed to open file");
+    let reader = BufReader::new(file);
+    let value = serde_json::from_reader(reader).expect("Failed to parse JSON");
+    remove_file(&file_path).unwrap();
+
+    value
 }
