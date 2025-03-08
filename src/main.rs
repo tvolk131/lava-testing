@@ -5,9 +5,13 @@ use std::{process::Command, str::FromStr};
 
 use bitcoin::bip32::{DerivationPath, Xpriv};
 use bitcoin::key::Secp256k1;
+use bitcoin::secp256k1::Message;
+use bitcoin::sighash::SighashCache;
+use bitcoin::transaction::Version;
 use bitcoin::{
-    Address as BtcAddress, Amount as BtcAmount, Network, PrivateKey, PublicKey as BtcPublicKey,
-    Txid as BtcTxid,
+    Address as BtcAddress, Amount as BtcAmount, EcdsaSighashType, Network, OutPoint, PrivateKey,
+    PublicKey as BtcPublicKey, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid as BtcTxid,
+    Witness,
 };
 use rand::Rng;
 use solana_sdk::pubkey::Pubkey as SolanaPubkey;
@@ -15,6 +19,8 @@ use solana_sdk::signature::Signature as SolanaSignature;
 use solana_sdk::signer::{SeedDerivable, Signer};
 
 const NETWORK: Network = Network::Testnet4;
+const FAUCET_REFUND_ADDRESS_STR: &str = "tb1qd8cg49sy99cln5tq2tpdm7xs4p9s5v6le4jx4c";
+const MIN_RELAY_FEE: u64 = 110;
 
 fn main() {
     let mut entropy = [0u8; 32];
@@ -121,6 +127,14 @@ fn main() {
 
     println!("Contract ID: {:?}", contract_id);
     println!("Collateral Repayment TxID: {:?}", collateral_repayment_txid);
+
+    send_funds_to_faucet(
+        root_priv_key,
+        NETWORK,
+        "m/84'/1'/0'/1/0"
+            .parse::<DerivationPath>()
+            .expect("Invalid derivation path"),
+    );
 }
 
 fn get_mutinynet_btc(address: BtcAddress, amount: BtcAmount) -> BtcTxid {
@@ -293,4 +307,86 @@ fn derive_keypair(
     let public_key = BtcPublicKey::from_private_key(&secp, &private_key);
 
     (private_key, public_key)
+}
+
+fn send_funds_to_faucet(
+    root_priv_key: Xpriv,
+    network: Network,
+    derivation_path: DerivationPath,
+) -> Transaction {
+    let (btc_change_private_key, btc_change_pubkey) =
+        derive_keypair(root_priv_key, network, derivation_path);
+
+    let btc_change_address = BtcAddress::p2wpkh(
+        &bitcoin::CompressedPublicKey(btc_change_pubkey.inner),
+        NETWORK,
+    );
+
+    let esplora_client = esplora_client::Builder::new("https://mutinynet.com/api").build_blocking();
+
+    let (change_txo_sum, change_tx) = loop {
+        let change_info = esplora_client
+            .get_address_stats(&btc_change_address)
+            .unwrap();
+
+        if let Ok(change_txs) = esplora_client.get_address_txs(&btc_change_address, None) {
+            if let Some(change_tx) = change_txs.first().cloned() {
+                if change_info.chain_stats.funded_txo_sum > 0 {
+                    break (change_info.chain_stats.funded_txo_sum, change_tx);
+                }
+            }
+        }
+    };
+
+    let faucet_refund_address = BtcAddress::from_str(FAUCET_REFUND_ADDRESS_STR)
+        .unwrap()
+        .assume_checked();
+
+    let (vout, _) = change_tx
+        .vout
+        .iter()
+        .enumerate()
+        .find(|txout| txout.1.scriptpubkey == btc_change_address.script_pubkey())
+        .unwrap();
+
+    let mut tx = Transaction {
+        version: Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: change_tx.txid,
+                vout: vout as u32,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: BtcAmount::from_sat(change_txo_sum - MIN_RELAY_FEE),
+            script_pubkey: faucet_refund_address.script_pubkey(),
+        }],
+    };
+
+    let secp = Secp256k1::new();
+
+    let mut cache = SighashCache::new(&tx);
+    let sighash = cache
+        .p2wpkh_signature_hash(
+            0,
+            &btc_change_address.script_pubkey(),
+            BtcAmount::from_sat(change_txo_sum),
+            EcdsaSighashType::All,
+        )
+        .expect("Sighash failed");
+    let message = Message::from_digest_slice(&sighash[..]).expect("Invalid sighash");
+    let signature = secp.sign_ecdsa(&message, &btc_change_private_key.inner);
+    let mut sig_with_hashtype = signature.serialize_der().to_vec();
+    sig_with_hashtype.push(EcdsaSighashType::All as u8);
+    tx.input[0].witness.push(sig_with_hashtype);
+    tx.input[0].witness.push(btc_change_pubkey.to_bytes());
+
+    // Publish transaction.
+    esplora_client.broadcast(&tx).unwrap();
+
+    tx
 }
