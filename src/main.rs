@@ -151,6 +151,8 @@ fn main() {
             .expect("Invalid derivation path"),
     );
     println!("Funds sent back to faucet.");
+
+    println!("Success!");
 }
 
 fn get_mutinynet_btc(address: &BtcAddress, amount: BtcAmount) -> BtcTxid {
