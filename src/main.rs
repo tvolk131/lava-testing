@@ -78,7 +78,9 @@ fn main() {
         i += 1;
 
         if i > MAX_RETRIES {
-            println!("Max retries reached. Sending funds to faucet...");
+            println!(
+                "Lava loan initiation failed. Max retries reached. Sending funds back to faucet..."
+            );
             send_funds_to_faucet(
                 root_priv_key,
                 NETWORK,
@@ -86,10 +88,9 @@ fn main() {
                     .parse::<DerivationPath>()
                     .expect("Invalid derivation path"),
             );
+            println!("Funds sent back to faucet.");
 
-            panic!(
-                "Unable to parse contract ID from lava borrow command after {MAX_RETRIES} retries"
-            );
+            std::process::exit(1);
         }
 
         println!("Lava loan initiation failed. Retrying... ({i} of {MAX_RETRIES})");
@@ -137,6 +138,7 @@ fn main() {
     println!("Contract ID: {:?}", contract_id);
     println!("Collateral Repayment TxID: {:?}", collateral_repayment_txid);
 
+    println!("Sending funds back to faucet...");
     send_funds_to_faucet(
         root_priv_key,
         NETWORK,
@@ -144,6 +146,7 @@ fn main() {
             .parse::<DerivationPath>()
             .expect("Invalid derivation path"),
     );
+    println!("Funds sent back to faucet.");
 }
 
 fn get_mutinynet_btc(address: BtcAddress, amount: BtcAmount) -> BtcTxid {
