@@ -78,6 +78,15 @@ fn main() {
         i += 1;
 
         if i > MAX_RETRIES {
+            println!("Max retries reached. Sending funds to faucet...");
+            send_funds_to_faucet(
+                root_priv_key,
+                NETWORK,
+                "m/84'/1'/0'/0/0"
+                    .parse::<DerivationPath>()
+                    .expect("Invalid derivation path"),
+            );
+
             panic!(
                 "Unable to parse contract ID from lava borrow command after {MAX_RETRIES} retries"
             );
@@ -314,27 +323,32 @@ fn send_funds_to_faucet(
     network: Network,
     derivation_path: DerivationPath,
 ) -> Transaction {
-    let (btc_change_private_key, btc_change_pubkey) =
-        derive_keypair(root_priv_key, network, derivation_path);
+    let (btc_private_key, btc_pubkey) = derive_keypair(root_priv_key, network, derivation_path);
 
-    let btc_change_address = BtcAddress::p2wpkh(
-        &bitcoin::CompressedPublicKey(btc_change_pubkey.inner),
-        NETWORK,
-    );
+    let btc_address = BtcAddress::p2wpkh(&bitcoin::CompressedPublicKey(btc_pubkey.inner), NETWORK);
 
     let esplora_client = esplora_client::Builder::new("https://mutinynet.com/api").build_blocking();
 
-    let (change_txo_sum, change_tx) = loop {
-        let change_info = esplora_client
-            .get_address_stats(&btc_change_address)
-            .unwrap();
+    const MAX_RETRIES: i32 = 5;
+    let mut i = 0;
+    let (txo_sum, tx) = loop {
+        let change_info = esplora_client.get_address_stats(&btc_address).unwrap();
 
-        if let Ok(change_txs) = esplora_client.get_address_txs(&btc_change_address, None) {
+        if let Ok(change_txs) = esplora_client.get_address_txs(&btc_address, None) {
             if let Some(change_tx) = change_txs.first().cloned() {
                 if change_info.chain_stats.funded_txo_sum > 0 {
                     break (change_info.chain_stats.funded_txo_sum, change_tx);
                 }
             }
+        }
+
+        i += 1;
+
+        if i > MAX_RETRIES {
+            panic!(
+                "Failed to retrieve change transaction after {} retries",
+                MAX_RETRIES
+            );
         }
     };
 
@@ -342,19 +356,19 @@ fn send_funds_to_faucet(
         .unwrap()
         .assume_checked();
 
-    let (vout, _) = change_tx
+    let (vout, _) = tx
         .vout
         .iter()
         .enumerate()
-        .find(|txout| txout.1.scriptpubkey == btc_change_address.script_pubkey())
+        .find(|txout| txout.1.scriptpubkey == btc_address.script_pubkey())
         .unwrap();
 
-    let mut tx = Transaction {
+    let mut faucet_funding_tx = Transaction {
         version: Version::TWO,
         lock_time: bitcoin::absolute::LockTime::ZERO,
         input: vec![TxIn {
             previous_output: OutPoint {
-                txid: change_tx.txid,
+                txid: tx.txid,
                 vout: vout as u32,
             },
             script_sig: ScriptBuf::new(),
@@ -362,31 +376,33 @@ fn send_funds_to_faucet(
             witness: Witness::new(),
         }],
         output: vec![TxOut {
-            value: BtcAmount::from_sat(change_txo_sum - MIN_RELAY_FEE),
+            value: BtcAmount::from_sat(txo_sum - MIN_RELAY_FEE),
             script_pubkey: faucet_refund_address.script_pubkey(),
         }],
     };
 
     let secp = Secp256k1::new();
 
-    let mut cache = SighashCache::new(&tx);
+    let mut cache = SighashCache::new(&faucet_funding_tx);
     let sighash = cache
         .p2wpkh_signature_hash(
             0,
-            &btc_change_address.script_pubkey(),
-            BtcAmount::from_sat(change_txo_sum),
+            &btc_address.script_pubkey(),
+            BtcAmount::from_sat(txo_sum),
             EcdsaSighashType::All,
         )
         .expect("Sighash failed");
     let message = Message::from_digest_slice(&sighash[..]).expect("Invalid sighash");
-    let signature = secp.sign_ecdsa(&message, &btc_change_private_key.inner);
+    let signature = secp.sign_ecdsa(&message, &btc_private_key.inner);
     let mut sig_with_hashtype = signature.serialize_der().to_vec();
     sig_with_hashtype.push(EcdsaSighashType::All as u8);
-    tx.input[0].witness.push(sig_with_hashtype);
-    tx.input[0].witness.push(btc_change_pubkey.to_bytes());
+    faucet_funding_tx.input[0].witness.push(sig_with_hashtype);
+    faucet_funding_tx.input[0]
+        .witness
+        .push(btc_pubkey.to_bytes());
 
     // Publish transaction.
-    esplora_client.broadcast(&tx).unwrap();
+    esplora_client.broadcast(&faucet_funding_tx).unwrap();
 
-    tx
+    faucet_funding_tx
 }
