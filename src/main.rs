@@ -4,6 +4,8 @@
 use std::fs::{File, remove_file};
 use std::io::BufReader;
 use std::process::{Output, Stdio};
+use std::thread::sleep;
+use std::time::Duration;
 use std::{process::Command, str::FromStr};
 
 use bitcoin::bip32::{DerivationPath, Xpriv};
@@ -24,7 +26,7 @@ use solana_sdk::signer::{SeedDerivable, Signer};
 const NETWORK: Network = Network::Testnet4;
 const FAUCET_REFUND_ADDRESS_STR: &str = "tb1qd8cg49sy99cln5tq2tpdm7xs4p9s5v6le4jx4c";
 const MIN_RELAY_FEE: u64 = 110;
-const MAX_RETRIES: i32 = 5;
+const MAX_RETRIES: i32 = 10;
 
 fn main() {
     let mut entropy = [0u8; 32];
@@ -97,6 +99,8 @@ fn main() {
         }
 
         println!("Lava loan initiation failed. Retrying... ({i} of {MAX_RETRIES})");
+
+        sleep(Duration::from_millis(1000));
     };
 
     let mut i = 0;
@@ -113,6 +117,8 @@ fn main() {
         );
 
         println!("Lava loan repayment failed. Retrying... ({i} of {MAX_RETRIES})");
+
+        sleep(Duration::from_millis(1000));
     }
 
     let closed_json_object = loop {
