@@ -1,3 +1,6 @@
+#![deny(clippy::nursery)]
+#![deny(clippy::pedantic)]
+
 use std::fs::{File, remove_file};
 use std::io::BufReader;
 use std::process::{Output, Stdio};
@@ -21,6 +24,7 @@ use solana_sdk::signer::{SeedDerivable, Signer};
 const NETWORK: Network = Network::Testnet4;
 const FAUCET_REFUND_ADDRESS_STR: &str = "tb1qd8cg49sy99cln5tq2tpdm7xs4p9s5v6le4jx4c";
 const MIN_RELAY_FEE: u64 = 110;
+const MAX_RETRIES: i32 = 5;
 
 fn main() {
     let mut entropy = [0u8; 32];
@@ -29,7 +33,7 @@ fn main() {
 
     let mnemonic = bip39::Mnemonic::from_entropy(&entropy).expect("Failed to generate mnemonic");
 
-    println!("Mnemonic: {}", mnemonic);
+    println!("Mnemonic: {mnemonic}");
 
     let root_priv_key = Xpriv::new_master(NETWORK, &mnemonic.to_seed(""))
         .expect("Failed to create root private key");
@@ -37,7 +41,7 @@ fn main() {
     let (_, btc_recv_pubkey) = derive_keypair(
         root_priv_key,
         NETWORK,
-        "m/84'/1'/0'/0/0"
+        &"m/84'/1'/0'/0/0"
             .parse::<DerivationPath>()
             .expect("Invalid derivation path"),
     );
@@ -47,7 +51,7 @@ fn main() {
         NETWORK,
     );
 
-    let btc_recv_txid = get_mutinynet_btc(btc_recv_address, BtcAmount::from_sat(50000));
+    let btc_recv_txid = get_mutinynet_btc(&btc_recv_address, BtcAmount::from_sat(50000));
 
     let derivation_path =
         solana_sdk::derivation_path::DerivationPath::from_absolute_path_str("m/44'/501'/0'/0")
@@ -60,13 +64,12 @@ fn main() {
 
     let sol_recv_signature = get_test_lava_usd(keypair.pubkey());
 
-    println!("Bitcoin Receive TxID: {}", btc_recv_txid);
-    println!("Solana Receive Signature: {}", sol_recv_signature);
+    println!("Bitcoin Receive TxID: {btc_recv_txid}");
+    println!("Solana Receive Signature: {sol_recv_signature}");
 
     install_lava_loans_borrower_cli();
 
     println!("Initiating lava loan...");
-    const MAX_RETRIES: i32 = 5;
     let mut i = 0;
     let contract_id = loop {
         let contract_id_or = lava_loans_borrower_cli_borrow(&mnemonic);
@@ -84,7 +87,7 @@ fn main() {
             send_funds_to_faucet(
                 root_priv_key,
                 NETWORK,
-                "m/84'/1'/0'/0/0"
+                &"m/84'/1'/0'/0/0"
                     .parse::<DerivationPath>()
                     .expect("Invalid derivation path"),
             );
@@ -104,9 +107,10 @@ fn main() {
 
         i += 1;
 
-        if i > MAX_RETRIES {
-            panic!("Unable to repay lava loan after {MAX_RETRIES} retries");
-        }
+        assert!(
+            i <= MAX_RETRIES,
+            "Unable to repay lava loan after {MAX_RETRIES} retries"
+        );
 
         println!("Lava loan repayment failed. Retrying... ({i} of {MAX_RETRIES})");
     }
@@ -135,21 +139,21 @@ fn main() {
         .as_str()
         .unwrap();
 
-    println!("Contract ID: {:?}", contract_id);
-    println!("Collateral Repayment TxID: {:?}", collateral_repayment_txid);
+    println!("Contract ID: {contract_id}");
+    println!("Collateral Repayment TxID: {collateral_repayment_txid}");
 
     println!("Sending funds back to faucet...");
     send_funds_to_faucet(
         root_priv_key,
         NETWORK,
-        "m/84'/1'/0'/1/0"
+        &"m/84'/1'/0'/1/0"
             .parse::<DerivationPath>()
             .expect("Invalid derivation path"),
     );
     println!("Funds sent back to faucet.");
 }
 
-fn get_mutinynet_btc(address: BtcAddress, amount: BtcAmount) -> BtcTxid {
+fn get_mutinynet_btc(address: &BtcAddress, amount: BtcAmount) -> BtcTxid {
     let output = Command::new("curl")
         .arg("-X")
         .arg("POST")
@@ -187,7 +191,7 @@ fn get_test_lava_usd(pubkey: SolanaPubkey) -> SolanaSignature {
         .arg("-H")
         .arg("Content-Type: application/json")
         .arg("-d")
-        .arg(format!("{{ \"pubkey\": \"{}\" }}", pubkey))
+        .arg(format!("{{ \"pubkey\": \"{pubkey}\" }}"))
         .output()
         .expect("Failed to execute curl command");
 
@@ -308,7 +312,7 @@ fn lava_loans_borrower_cli_get_contract(
 fn derive_keypair(
     root_priv_key: Xpriv,
     network: Network,
-    derivation_path: DerivationPath,
+    derivation_path: &DerivationPath,
 ) -> (PrivateKey, BtcPublicKey) {
     let secp = Secp256k1::new();
     let child_priv_key = root_priv_key
@@ -324,7 +328,7 @@ fn derive_keypair(
 fn send_funds_to_faucet(
     root_priv_key: Xpriv,
     network: Network,
-    derivation_path: DerivationPath,
+    derivation_path: &DerivationPath,
 ) -> Transaction {
     let (btc_private_key, btc_pubkey) = derive_keypair(root_priv_key, network, derivation_path);
 
@@ -332,7 +336,6 @@ fn send_funds_to_faucet(
 
     let esplora_client = esplora_client::Builder::new("https://mutinynet.com/api").build_blocking();
 
-    const MAX_RETRIES: i32 = 5;
     let mut i = 0;
     let (txo_sum, tx) = loop {
         let change_info = esplora_client.get_address_stats(&btc_address).unwrap();
@@ -347,12 +350,10 @@ fn send_funds_to_faucet(
 
         i += 1;
 
-        if i > MAX_RETRIES {
-            panic!(
-                "Failed to retrieve change transaction after {} retries",
-                MAX_RETRIES
-            );
-        }
+        assert!(
+            i <= MAX_RETRIES,
+            "Failed to retrieve change transaction after {MAX_RETRIES} retries"
+        );
     };
 
     let faucet_refund_address = BtcAddress::from_str(FAUCET_REFUND_ADDRESS_STR)
@@ -372,7 +373,7 @@ fn send_funds_to_faucet(
         input: vec![TxIn {
             previous_output: OutPoint {
                 txid: tx.txid,
-                vout: vout as u32,
+                vout: vout.try_into().unwrap(),
             },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
