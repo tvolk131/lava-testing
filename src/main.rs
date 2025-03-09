@@ -40,13 +40,11 @@ fn main() {
     let root_priv_key = Xpriv::new_master(NETWORK, &mnemonic.to_seed(""))
         .expect("Failed to create root private key");
 
-    let (_, btc_recv_pubkey) = derive_keypair(
-        root_priv_key,
-        NETWORK,
-        &"m/84'/1'/0'/0/0"
-            .parse::<DerivationPath>()
-            .expect("Invalid derivation path"),
-    );
+    let btc_recv_derivation_path = "m/84'/1'/0'/0/0"
+        .parse::<DerivationPath>()
+        .expect("Invalid derivation path");
+
+    let (_, btc_recv_pubkey) = derive_keypair(root_priv_key, NETWORK, &btc_recv_derivation_path);
 
     let btc_recv_address = BtcAddress::p2wpkh(
         &bitcoin::CompressedPublicKey(btc_recv_pubkey.inner),
@@ -86,13 +84,7 @@ fn main() {
             println!(
                 "Lava loan initiation failed. Max retries reached. Sending funds back to faucet..."
             );
-            send_funds_to_faucet(
-                root_priv_key,
-                NETWORK,
-                &"m/84'/1'/0'/0/0"
-                    .parse::<DerivationPath>()
-                    .expect("Invalid derivation path"),
-            );
+            send_funds_to_faucet(root_priv_key, NETWORK, &btc_recv_derivation_path);
             println!("Funds sent back to faucet.");
 
             std::process::exit(1);
@@ -182,13 +174,16 @@ fn get_mutinynet_btc(address: &BtcAddress, amount: BtcAmount) -> BtcTxid {
     let json_output =
         serde_json::Value::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
 
-    let txid_str = json_output
+    let txid_str_or = json_output
         .as_object()
-        .expect("Mutinynet faucet response is not a JSON object")
-        .get("txid")
-        .expect("Failed to find 'txid' field in Mutinynet faucet response")
-        .as_str()
-        .expect("Failed to parse 'txid' in Mutinynet faucet response");
+        .and_then(|obj| obj.get("txid"))
+        .and_then(|txid_value| txid_value.as_str());
+
+    let Some(txid_str) = txid_str_or else {
+        panic!(
+            "Failed to parse txid from Mutinynet faucet response. This likely means the faucet is down or empty. Full response:\n{output:?}"
+        );
+    };
 
     BtcTxid::from_str(txid_str).expect("Failed to parse 'txid' in Mutinynet faucet response")
 }
