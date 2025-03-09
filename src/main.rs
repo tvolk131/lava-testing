@@ -129,6 +129,8 @@ fn main() {
         {
             break closed_json.as_object().unwrap().clone();
         }
+
+        sleep(Duration::from_millis(1000));
     };
 
     let collateral_repayment_txid = closed_json_object
@@ -219,18 +221,46 @@ fn get_test_lava_usd(pubkey: SolanaPubkey) -> SolanaSignature {
 }
 
 fn install_lava_loans_borrower_cli() {
-    let _ = Command::new("brew")
-        .arg("install")
-        .arg("libpq")
-        .output()
-        .expect("Failed to execute `brew install libpq` command");
+    if std::env::consts::OS == "macos" {
+        println!("Installing dependencies for macos");
 
-    let _ = Command::new("curl")
-        .arg("-o")
-        .arg("loans-borrower-cli")
-        .arg("https://loans-borrower-cli.s3.amazonaws.com/loans-borrower-cli-mac")
-        .output()
-        .expect("Failed to install loans-borrower-cli");
+        let _ = Command::new("brew")
+            .arg("install")
+            .arg("libpq")
+            .output()
+            .expect("Failed to execute `brew install libpq` command");
+
+        let _ = Command::new("curl")
+            .arg("-o")
+            .arg("loans-borrower-cli")
+            .arg("https://loans-borrower-cli.s3.amazonaws.com/loans-borrower-cli-mac")
+            .output()
+            .expect("Failed to install loans-borrower-cli");
+    } else if std::env::consts::OS == "linux" {
+        println!("Installing dependencies for Linux");
+
+        let _ = Command::new("sudo")
+            .arg("apt-get")
+            .arg("update")
+            .output()
+            .expect("Failed to execute `sudo apt-get update` command");
+
+        let _ = Command::new("sudo")
+            .arg("apt-get")
+            .arg("install")
+            .arg("libpq-dev")
+            .output()
+            .expect("Failed to execute `sudo install libpq-dev` command");
+
+        let _ = Command::new("curl")
+            .arg("-o")
+            .arg("loans-borrower-cli")
+            .arg("https://loans-borrower-cli.s3.amazonaws.com/loans-borrower-cli-linux")
+            .output()
+            .expect("Failed to install loans-borrower-cli");
+    } else {
+        panic!("Unsupported OS");
+    }
 
     let _ = Command::new("chmod")
         .arg("+x")
