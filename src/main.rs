@@ -2,10 +2,9 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::cognitive_complexity)]
 
-use std::fs::{File, remove_file};
-use std::io::BufReader;
+use lava_loans_borrower_cli::LavaLoansBorrowerCli;
 use std::net::SocketAddr;
-use std::process::Stdio;
+use std::path::Path;
 use std::sync::Arc;
 use std::thread::sleep;
 use std::time::Duration;
@@ -31,6 +30,8 @@ use solana_sdk::signer::{SeedDerivable, Signer};
 use thiserror::Error;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
+
+mod lava_loans_borrower_cli;
 
 #[derive(Error, Debug)]
 pub enum LavaTestError {
@@ -65,7 +66,7 @@ pub enum LavaTestError {
 const NETWORK: Network = Network::Testnet4;
 const FAUCET_REFUND_ADDRESS_STR: &str = "tb1qd8cg49sy99cln5tq2tpdm7xs4p9s5v6le4jx4c";
 const MIN_RELAY_FEE: u64 = 110;
-const MAX_RETRIES: i32 = 10;
+pub const MAX_RETRIES: i32 = 10;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -143,12 +144,12 @@ async fn run_test_handler(State(test_lock): State<TestLock>) -> (StatusCode, Str
 fn run_test() -> Result<String> {
     info!("Starting Lava test run...");
 
-    if let Err(e) = install_lava_loans_borrower_cli() {
-        error!("Failed to install LAVA loans borrower CLI: {e}");
-        return Err(e);
-    }
-
     let (mnemonic, root_priv_key) = initialize_wallet()?;
+
+    let cli = LavaLoansBorrowerCli::new(
+        Path::new("./loans-borrower-cli").to_path_buf(),
+        mnemonic.clone(),
+    )?;
 
     let btc_recv_derivation_path = "m/84'/1'/0'/0/0"
         .parse::<BtcDerivationPath>()
@@ -169,7 +170,7 @@ fn run_test() -> Result<String> {
         BtcAmount::from_sat(50000),
     )?;
 
-    let contract_id = match create_loan_contract(&mnemonic) {
+    let contract_id = match cli.borrow() {
         Ok(id) => id,
         Err(err) => {
             send_funds_to_faucet(root_priv_key, NETWORK, &btc_recv_derivation_path)
@@ -178,9 +179,9 @@ fn run_test() -> Result<String> {
         }
     };
 
-    repay_loan_contract(&mnemonic, &contract_id)?;
+    cli.repay(&contract_id)?;
 
-    wait_for_contract_to_be_closed(&mnemonic, &contract_id)?;
+    cli.wait_for_contract_to_be_closed(&contract_id)?;
 
     info!("Contract ID: {contract_id}");
 
@@ -240,81 +241,6 @@ fn request_funds_from_faucets(
     info!("Solana Receive Signature: {sol_recv_signature}");
 
     Ok((btc_recv_txid, sol_recv_signature))
-}
-
-fn create_loan_contract(mnemonic: &bip39::Mnemonic) -> Result<String> {
-    info!("Initiating lava loan...");
-
-    for i in 1..=MAX_RETRIES {
-        if let Ok(contract_id) = lava_loans_borrower_cli_borrow(mnemonic) {
-            info!("Lava loan initiated, contract ID: {contract_id}");
-            return Ok(contract_id);
-        }
-
-        info!("Lava loan initiation failed. Retrying... ({i} of {MAX_RETRIES})");
-        sleep(Duration::from_millis(1000));
-    }
-
-    error!("Lava loan initiation failed. Max retries reached.");
-    Err(LavaTestError::LoanInitiationFailed.into())
-}
-
-fn repay_loan_contract(mnemonic: &bip39::Mnemonic, contract_id: &str) -> Result<()> {
-    let mut i = 0;
-    loop {
-        if lava_loans_borrower_cli_repay(mnemonic, contract_id).is_ok() {
-            info!("Loan repaid successfully");
-            return Ok(());
-        }
-
-        i += 1;
-
-        if i > MAX_RETRIES {
-            error!("Unable to repay lava loan after {MAX_RETRIES} retries");
-            return Err(LavaTestError::LoanRepaymentFailed(MAX_RETRIES).into());
-        }
-
-        info!("Lava loan repayment failed. Retrying... ({i} of {MAX_RETRIES})");
-        sleep(Duration::from_millis(1000));
-    }
-}
-
-fn wait_for_contract_to_be_closed(
-    mnemonic: &bip39::Mnemonic,
-    contract_id: &str,
-) -> Result<BtcTxid> {
-    info!("Waiting for confirmation");
-
-    let closed_json_object = loop {
-        let contract_data = lava_loans_borrower_cli_get_contract(mnemonic, contract_id)
-            .context("Failed to get contract data")?;
-
-        if let Some(closed_json) = contract_data
-            .as_object()
-            .and_then(|obj| obj.get("Closed"))
-            .and_then(|closed| closed.as_object())
-        {
-            break closed_json.clone();
-        }
-
-        sleep(Duration::from_millis(1000));
-    };
-
-    let collateral_repayment_txid_str = closed_json_object
-        .get("outcome")
-        .and_then(|o| o.as_object())
-        .and_then(|o| o.get("repayment"))
-        .and_then(|r| r.as_object())
-        .and_then(|r| r.get("collateral_repayment_txid"))
-        .and_then(|t| t.as_str())
-        .ok_or_else(|| {
-            LavaTestError::DataExtractionFailed(
-                "Failed to extract collateral repayment txid".into(),
-            )
-        })?;
-
-    BtcTxid::from_str(collateral_repayment_txid_str)
-        .context("Failed to parse 'collateral_repayment_txid' in Lava closed contract JSON data")
 }
 
 fn get_mutinynet_btc(address: &BtcAddress, amount: BtcAmount) -> Result<BtcTxid> {
@@ -400,204 +326,6 @@ fn get_test_lava_usd(pubkey: SolanaPubkey) -> Result<SolanaSignature> {
 
     SolanaSignature::from_str(signature_str)
         .context("Failed to parse 'signature' in Solana USD faucet response")
-}
-
-fn get_download_url() -> Result<&'static str> {
-    match std::env::consts::OS {
-        "macos" => Ok("https://loans-borrower-cli.s3.amazonaws.com/loans-borrower-cli-mac"),
-        "linux" => Ok("https://loans-borrower-cli.s3.amazonaws.com/loans-borrower-cli-linux"),
-        os => {
-            error!("Unsupported OS: {os}");
-            Err(anyhow::anyhow!("Unsupported OS: {}", os))
-        }
-    }
-}
-
-fn install_lava_loans_borrower_cli() -> Result<()> {
-    // Remove existing loans-borrower-cli if it exists.
-    // This ensures we always download and run the latest version.
-    if std::path::Path::new("./loans-borrower-cli").exists() {
-        remove_file("./loans-borrower-cli")?;
-    }
-
-    install_dependencies();
-
-    download_borrower_cli()?;
-
-    make_cli_executable()?;
-
-    info!("loans-borrower-cli installation completed");
-    Ok(())
-}
-
-fn install_dependencies() {
-    match std::env::consts::OS {
-        "macos" => install_macos_dependencies(),
-        "linux" => install_linux_dependencies(),
-        _ => {} // No dependencies for other platforms
-    }
-}
-
-fn install_macos_dependencies() {
-    info!("Installing dependencies for macOS");
-    if let Err(e) = Command::new("brew").arg("install").arg("libpq").output() {
-        error!("Failed to execute `brew install libpq` command: {e}");
-    }
-}
-
-fn install_linux_dependencies() {
-    info!("Installing dependencies for Linux");
-    if let Err(e) = Command::new("sudo").arg("apt-get").arg("update").output() {
-        error!("Failed to execute `sudo apt-get update` command: {e}");
-    }
-
-    if let Err(e) = Command::new("sudo")
-        .arg("apt-get")
-        .arg("install")
-        .arg("libpq-dev")
-        .output()
-    {
-        error!("Failed to execute `sudo install libpq-dev` command: {e}");
-    }
-}
-
-fn download_borrower_cli() -> Result<()> {
-    info!("Downloading loans-borrower-cli...");
-
-    let download_url = get_download_url()?;
-
-    let output = Command::new("curl")
-        .arg("-o")
-        .arg("loans-borrower-cli")
-        .arg(download_url)
-        .output()
-        .context("Failed to download loans-borrower-cli")?;
-
-    if output.status.success() {
-        info!("Downloaded loans-borrower-cli successfully");
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        error!("Failed to download loans-borrower-cli: {stderr}");
-        Err(anyhow::anyhow!(
-            "Failed to download loans-borrower-cli: {}",
-            stderr
-        ))
-    }
-}
-
-fn make_cli_executable() -> Result<()> {
-    let output = Command::new("chmod")
-        .arg("+x")
-        .arg("./loans-borrower-cli")
-        .output()
-        .context("Failed to execute chmod command")?;
-
-    if output.status.success() {
-        info!("Set executable permissions on loans-borrower-cli");
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        error!("Failed to set executable permissions: {stderr}");
-        Err(anyhow::anyhow!(
-            "Failed to set executable permissions: {}",
-            stderr
-        ))
-    }
-}
-
-fn lava_loans_borrower_cli_borrow(mnemonic: &bip39::Mnemonic) -> Result<String> {
-    let output = Command::new("./loans-borrower-cli")
-        .env("MNEMONIC", mnemonic.to_string())
-        .arg("--testnet")
-        .arg("--disable-backup-contracts")
-        .arg("borrow")
-        .arg("init")
-        .arg("--loan-capital-asset")
-        .arg("solana-lava-usd")
-        .arg("--ltv-ratio-bp")
-        .arg("5000")
-        .arg("--loan-duration-days")
-        .arg("4")
-        .arg("--loan-amount")
-        .arg("2")
-        .arg("--finalize")
-        .stdout(Stdio::piped())
-        .output()
-        .context("Failed to execute `loans-borrower-cli borrow init` command")?;
-
-    let re = regex::Regex::new(r"New contract ID: ([0-9a-f]{64})\n").unwrap();
-
-    // TODO: Figure out why we have to check stderr rather than stdout.
-    let Some(contract_id) = re
-        .captures(&String::from_utf8_lossy(&output.stderr))
-        .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
-    else {
-        return Err(anyhow::anyhow!(
-            "Failed to extract contract ID from `loans-borrower-cli borrow init` command"
-        ));
-    };
-
-    Ok(contract_id)
-}
-
-fn lava_loans_borrower_cli_repay(mnemonic: &bip39::Mnemonic, contract_id: &str) -> Result<()> {
-    let output = Command::new("./loans-borrower-cli")
-        .env("MNEMONIC", mnemonic.to_string())
-        .arg("--testnet")
-        .arg("--disable-backup-contracts")
-        .arg("borrow")
-        .arg("repay")
-        .arg("--contract-id")
-        .arg(contract_id)
-        .stdout(Stdio::piped())
-        .output()
-        .context("Failed to execute `loans-borrower-cli borrow` command")?;
-
-    if String::from_utf8_lossy(&output.stderr).contains("The collateral has been reclaimed!") {
-        Ok(())
-    } else {
-        // Instead of returning the Output, we'll return a more descriptive error
-        Err(anyhow::anyhow!(
-            "Loan repayment failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ))
-    }
-}
-
-fn lava_loans_borrower_cli_get_contract(
-    mnemonic: &bip39::Mnemonic,
-    contract_id: &str,
-) -> Result<serde_json::Value> {
-    let file_path = format!("./{contract_id}.json");
-
-    Command::new("./loans-borrower-cli")
-        .env("MNEMONIC", mnemonic.to_string())
-        .arg("--testnet")
-        .arg("--disable-backup-contracts")
-        .arg("get-contract")
-        .arg("--contract-id")
-        .arg(contract_id)
-        .arg("--verbose")
-        .arg("--output-file")
-        .arg(&file_path)
-        .stdout(Stdio::piped())
-        .output()
-        .context("Failed to execute `loans-borrower-cli get-contract` command")?;
-
-    // Using the ? operator with anyhow's context for better error handling
-    let file =
-        File::open(&file_path).context(format!("Failed to open contract file: {file_path}"))?;
-    let reader = BufReader::new(file);
-    let value = serde_json::from_reader(reader).context("Failed to parse contract JSON")?;
-
-    // Still use unwrap here as this cleanup operation failing is not critical to the success of the function
-    // If needed, we could add better error handling here too
-    remove_file(&file_path).unwrap_or_else(|e| {
-        info!("Failed to remove temporary contract file: {e}");
-    });
-
-    Ok(value)
 }
 
 fn derive_keypair(
