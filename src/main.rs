@@ -1,14 +1,19 @@
-#![deny(clippy::nursery)]
-#![deny(clippy::pedantic)]
+#![warn(clippy::nursery)]
+#![warn(clippy::pedantic)]
 
 use std::fs::{File, remove_file};
 use std::io::BufReader;
-use std::process::{Output, Stdio};
+use std::net::SocketAddr;
+use std::process::Stdio;
+use std::sync::Arc;
 use std::thread::sleep;
 use std::time::Duration;
 use std::{process::Command, str::FromStr};
+use tokio::sync::Mutex;
 
-use bitcoin::bip32::{DerivationPath, Xpriv};
+use anyhow::{Context, Result};
+use axum::{Router, extract::State, http::StatusCode, routing::get};
+use bitcoin::bip32::{DerivationPath as BtcDerivationPath, Xpriv};
 use bitcoin::key::Secp256k1;
 use bitcoin::secp256k1::Message;
 use bitcoin::sighash::SighashCache;
@@ -18,144 +23,309 @@ use bitcoin::{
     PublicKey as BtcPublicKey, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid as BtcTxid,
     Witness,
 };
-use rand::Rng;
+use solana_sdk::derivation_path::DerivationPath as SolanaDerivationPath;
 use solana_sdk::pubkey::Pubkey as SolanaPubkey;
 use solana_sdk::signature::Signature as SolanaSignature;
 use solana_sdk::signer::{SeedDerivable, Signer};
+use thiserror::Error;
+use tower_http::trace::TraceLayer;
+use tracing::{error, info};
+
+#[derive(Error, Debug)]
+pub enum LavaTestError {
+    #[error("Failed to generate mnemonic: {0}")]
+    MnemonicGeneration(#[source] bip39::Error),
+
+    #[error("Bitcoin faucet error: {0}")]
+    BitcoinFaucet(String),
+
+    #[error("Solana faucet error: {0}")]
+    SolanaFaucet(String),
+
+    #[error("Loan initiation failed after maximum retries")]
+    LoanInitiationFailed,
+
+    #[error("Unable to repay loan after {0} retries")]
+    LoanRepaymentFailed(i32),
+
+    #[error("Failed to extract data: {0}")]
+    DataExtractionFailed(String),
+
+    #[error("Funds return failed: {0}")]
+    FundsReturnFailed(String),
+
+    #[error("I/O error: {0}")]
+    IoError(#[from] std::io::Error),
+
+    #[error("JSON error: {0}")]
+    JsonError(#[from] serde_json::Error),
+}
 
 const NETWORK: Network = Network::Testnet4;
 const FAUCET_REFUND_ADDRESS_STR: &str = "tb1qd8cg49sy99cln5tq2tpdm7xs4p9s5v6le4jx4c";
 const MIN_RELAY_FEE: u64 = 110;
 const MAX_RETRIES: i32 = 10;
 
-fn main() {
-    let mut entropy = [0u8; 32];
-    let mut rng = rand::rng();
-    rng.fill(&mut entropy);
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Initialize tracing
+    tracing_subscriber::fmt::init();
 
-    let mnemonic = bip39::Mnemonic::from_entropy(&entropy).expect("Failed to generate mnemonic");
+    info!("Starting Lava Testing HTTP server");
 
-    println!("Mnemonic: {mnemonic}");
+    // Check if CLI tool is installed
+    if let Err(e) = install_lava_loans_borrower_cli() {
+        error!("Failed to install LAVA loans borrower CLI: {e}");
+        return Err(e);
+    }
 
-    let root_priv_key = Xpriv::new_master(NETWORK, &mnemonic.to_seed(""))
-        .expect("Failed to create root private key");
+    // Create a shared flag to track if a test is currently running
+    let test_lock = Arc::new(Mutex::new(()));
+
+    // Build our application with a route
+    let app = Router::new()
+        .route("/run-test", get(run_test_handler))
+        .route("/health", get(health_check))
+        .layer(TraceLayer::new_for_http())
+        .with_state(test_lock);
+
+    // Run our app
+    let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
+    info!("Listening on {addr}");
+
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .context("Failed to bind to address")?;
+
+    axum::serve(listener, app)
+        .await
+        .context("Failed to start server")?;
+
+    Ok(())
+}
+
+// Lock to be shared between handlers.
+type AppState = Arc<Mutex<()>>;
+
+#[axum::debug_handler]
+async fn health_check() -> StatusCode {
+    StatusCode::OK
+}
+
+#[axum::debug_handler]
+async fn run_test_handler(State(state): State<AppState>) -> (StatusCode, String) {
+    let Ok(test_lock_guard) = state.try_lock() else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "A test is already running. Please try again later.".to_string(),
+        );
+    };
+
+    // Run test in a separate blocking task to avoid blocking the HTTP server.
+    let result = tokio::task::spawn_blocking(run_test).await;
+
+    let (status, message) = match result {
+        Ok(test_result) => match test_result {
+            Ok(contract_id) => (
+                StatusCode::OK,
+                format!("Test passed successfully! Contract ID: {contract_id}"),
+            ),
+            Err(err) => {
+                error!("Test error: {err:?}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Test failed: {err}"),
+                )
+            }
+        },
+        Err(join_err) => {
+            error!("Test panic: {join_err}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Test task panicked: {join_err}"),
+            )
+        }
+    };
+
+    drop(test_lock_guard);
+
+    (status, message)
+}
+
+fn run_test() -> Result<String> {
+    info!("Starting Lava test run...");
+
+    let (mnemonic, root_priv_key) = initialize_wallet()?;
 
     let btc_recv_derivation_path = "m/84'/1'/0'/0/0"
-        .parse::<DerivationPath>()
-        .expect("Invalid derivation path");
+        .parse::<BtcDerivationPath>()
+        .context("Invalid derivation path")?;
 
-    let (_, btc_recv_pubkey) = derive_keypair(root_priv_key, NETWORK, &btc_recv_derivation_path);
+    let btc_change_derivation_path = "m/84'/1'/0'/1/0"
+        .parse::<BtcDerivationPath>()
+        .context("Invalid derivation path")?;
+
+    let sol_recv_derivation_path = SolanaDerivationPath::from_absolute_path_str("m/44'/501'/0'/0")
+        .context("Invalid Solana derivation path")?;
+
+    request_funds_from_faucets(
+        &mnemonic,
+        root_priv_key,
+        &btc_recv_derivation_path,
+        sol_recv_derivation_path,
+        BtcAmount::from_sat(50000),
+    )?;
+
+    let contract_id = match create_loan_contract(&mnemonic) {
+        Ok(id) => id,
+        Err(err) => {
+            send_funds_to_faucet(root_priv_key, NETWORK, &btc_recv_derivation_path)
+                .context("Failed to send funds back to faucet")?;
+            return Err(err);
+        }
+    };
+
+    repay_loan_contract(&mnemonic, &contract_id)?;
+
+    wait_for_contract_to_be_closed(&mnemonic, &contract_id)?;
+
+    info!("Contract ID: {contract_id}");
+
+    // Return remaining funds to faucet.
+    send_funds_to_faucet(root_priv_key, NETWORK, &btc_change_derivation_path)
+        .context("Failed to send funds back to faucet")?;
+
+    info!("Test completed successfully!");
+
+    Ok(contract_id)
+}
+
+fn initialize_wallet() -> Result<(bip39::Mnemonic, Xpriv)> {
+    let mut entropy = [0u8; 32];
+    getrandom::getrandom(&mut entropy).context("Failed to generate random entropy")?;
+
+    let mnemonic = bip39::Mnemonic::from_entropy(&entropy)
+        .map_err(LavaTestError::MnemonicGeneration)
+        .context("Failed to generate mnemonic")?;
+
+    info!("Mnemonic generated");
+
+    let root_priv_key = Xpriv::new_master(NETWORK, &mnemonic.to_seed(""))
+        .context("Failed to create root private key")?;
+
+    Ok((mnemonic, root_priv_key))
+}
+
+fn request_funds_from_faucets(
+    mnemonic: &bip39::Mnemonic,
+    root_priv_key: Xpriv,
+    btc_recv_derivation_path: &BtcDerivationPath,
+    sol_recv_derivation_path: SolanaDerivationPath,
+    amount: BtcAmount,
+) -> Result<(BtcTxid, SolanaSignature)> {
+    let (_, btc_recv_pubkey) = derive_keypair(root_priv_key, NETWORK, btc_recv_derivation_path);
 
     let btc_recv_address = BtcAddress::p2wpkh(
         &bitcoin::CompressedPublicKey(btc_recv_pubkey.inner),
         NETWORK,
     );
 
-    let btc_recv_txid = get_mutinynet_btc(&btc_recv_address, BtcAmount::from_sat(50000));
+    info!("Requesting BTC from faucet");
+    let btc_recv_txid =
+        get_mutinynet_btc(&btc_recv_address, amount).context("Failed to get BTC from faucet")?;
 
-    let derivation_path =
-        solana_sdk::derivation_path::DerivationPath::from_absolute_path_str("m/44'/501'/0'/0")
-            .expect("Invalid derivation path");
     let keypair = solana_sdk::signature::Keypair::from_seed_and_derivation_path(
         &mnemonic.to_seed(""),
-        Some(derivation_path),
+        Some(sol_recv_derivation_path),
     )
-    .expect("Failed to derive keypair");
+    .map_err(|e| anyhow::anyhow!("Failed to derive keypair: {}", e))?;
 
-    let sol_recv_signature = get_test_lava_usd(keypair.pubkey());
+    info!("Requesting Lava USD from faucet");
+    let sol_recv_signature =
+        get_test_lava_usd(keypair.pubkey()).context("Failed to get LAVA USD")?;
 
-    println!("Bitcoin Receive TxID: {btc_recv_txid}");
-    println!("Solana Receive Signature: {sol_recv_signature}");
+    info!("Bitcoin Receive TxID: {btc_recv_txid}");
+    info!("Solana Receive Signature: {sol_recv_signature}");
 
-    install_lava_loans_borrower_cli();
+    Ok((btc_recv_txid, sol_recv_signature))
+}
 
-    println!("Initiating lava loan...");
+fn create_loan_contract(mnemonic: &bip39::Mnemonic) -> Result<String> {
+    info!("Initiating lava loan...");
+
+    for i in 1..=MAX_RETRIES {
+        if let Ok(contract_id) = lava_loans_borrower_cli_borrow(mnemonic) {
+            info!("Lava loan initiated, contract ID: {contract_id}");
+            return Ok(contract_id);
+        }
+
+        info!("Lava loan initiation failed. Retrying... ({i} of {MAX_RETRIES})");
+        sleep(Duration::from_millis(1000));
+    }
+
+    error!("Lava loan initiation failed. Max retries reached.");
+    Err(LavaTestError::LoanInitiationFailed.into())
+}
+
+fn repay_loan_contract(mnemonic: &bip39::Mnemonic, contract_id: &str) -> Result<()> {
     let mut i = 0;
-    let contract_id = loop {
-        let contract_id_or = lava_loans_borrower_cli_borrow(&mnemonic);
-
-        if let Some(contract_id) = contract_id_or {
-            break contract_id;
+    loop {
+        if lava_loans_borrower_cli_repay(mnemonic, contract_id).is_ok() {
+            info!("Loan repaid successfully");
+            return Ok(());
         }
 
         i += 1;
 
         if i > MAX_RETRIES {
-            println!(
-                "Lava loan initiation failed. Max retries reached. Sending funds back to faucet..."
-            );
-            send_funds_to_faucet(root_priv_key, NETWORK, &btc_recv_derivation_path);
-            println!("Funds sent back to faucet.");
-
-            std::process::exit(1);
+            error!("Unable to repay lava loan after {MAX_RETRIES} retries");
+            return Err(LavaTestError::LoanRepaymentFailed(MAX_RETRIES).into());
         }
 
-        println!("Lava loan initiation failed. Retrying... ({i} of {MAX_RETRIES})");
-
-        sleep(Duration::from_millis(1000));
-    };
-
-    let mut i = 0;
-    loop {
-        if lava_loans_borrower_cli_repay(&mnemonic, &contract_id).is_ok() {
-            break;
-        }
-
-        i += 1;
-
-        assert!(
-            i <= MAX_RETRIES,
-            "Unable to repay lava loan after {MAX_RETRIES} retries"
-        );
-
-        println!("Lava loan repayment failed. Retrying... ({i} of {MAX_RETRIES})");
-
+        info!("Lava loan repayment failed. Retrying... ({i} of {MAX_RETRIES})");
         sleep(Duration::from_millis(1000));
     }
+}
+
+fn wait_for_contract_to_be_closed(
+    mnemonic: &bip39::Mnemonic,
+    contract_id: &str,
+) -> Result<BtcTxid> {
+    info!("Waiting for confirmation");
 
     let closed_json_object = loop {
-        if let Some(closed_json) = lava_loans_borrower_cli_get_contract(&mnemonic, &contract_id)
+        let contract_data = lava_loans_borrower_cli_get_contract(mnemonic, contract_id)
+            .context("Failed to get contract data")?;
+
+        if let Some(closed_json) = contract_data
             .as_object()
-            .unwrap()
-            .get("Closed")
+            .and_then(|obj| obj.get("Closed"))
+            .and_then(|closed| closed.as_object())
         {
-            break closed_json.as_object().unwrap().clone();
+            break closed_json.clone();
         }
 
         sleep(Duration::from_millis(1000));
     };
 
-    let collateral_repayment_txid = closed_json_object
+    let collateral_repayment_txid_str = closed_json_object
         .get("outcome")
-        .unwrap()
-        .as_object()
-        .unwrap()
-        .get("repayment")
-        .unwrap()
-        .as_object()
-        .unwrap()
-        .get("collateral_repayment_txid")
-        .unwrap()
-        .as_str()
-        .unwrap();
+        .and_then(|o| o.as_object())
+        .and_then(|o| o.get("repayment"))
+        .and_then(|r| r.as_object())
+        .and_then(|r| r.get("collateral_repayment_txid"))
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| {
+            LavaTestError::DataExtractionFailed(
+                "Failed to extract collateral repayment txid".into(),
+            )
+        })?;
 
-    println!("Contract ID: {contract_id}");
-    println!("Collateral Repayment TxID: {collateral_repayment_txid}");
-
-    println!("Sending funds back to faucet...");
-    send_funds_to_faucet(
-        root_priv_key,
-        NETWORK,
-        &"m/84'/1'/0'/1/0"
-            .parse::<DerivationPath>()
-            .expect("Invalid derivation path"),
-    );
-    println!("Funds sent back to faucet.");
-
-    println!("Success!");
+    BtcTxid::from_str(collateral_repayment_txid_str)
+        .context("Failed to parse 'collateral_repayment_txid' in Lava closed contract JSON data")
 }
 
-fn get_mutinynet_btc(address: &BtcAddress, amount: BtcAmount) -> BtcTxid {
+fn get_mutinynet_btc(address: &BtcAddress, amount: BtcAmount) -> Result<BtcTxid> {
     let output = Command::new("curl")
         .arg("-X")
         .arg("POST")
@@ -164,31 +334,38 @@ fn get_mutinynet_btc(address: &BtcAddress, amount: BtcAmount) -> BtcTxid {
         .arg("Content-Type: application/json")
         .arg("-d")
         .arg(format!(
-            "{{ \"address\": \"{}\", \"sats\": {} }}",
-            address,
+            "{{ \"address\": \"{address}\", \"sats\": {} }}",
             amount.to_sat()
         ))
         .output()
-        .expect("Failed to execute curl command");
+        .context("Failed to execute curl command")?;
 
-    let json_output =
-        serde_json::Value::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(LavaTestError::BitcoinFaucet(format!(
+            "Mutinynet faucet request failed: {stderr}"
+        ))
+        .into());
+    }
 
-    let txid_str_or = json_output
+    let json_output = serde_json::Value::from_str(&String::from_utf8_lossy(&output.stdout))
+        .context("Failed to parse faucet response as JSON")?;
+
+    let txid_str = json_output
         .as_object()
         .and_then(|obj| obj.get("txid"))
-        .and_then(|txid_value| txid_value.as_str());
+        .and_then(|txid_value| txid_value.as_str())
+        .ok_or_else(|| {
+            let output_str = format!("{output:?}");
+            LavaTestError::BitcoinFaucet(format!(
+                "Failed to parse txid from Mutinynet faucet response. This likely means the faucet is down or empty. Full response:\n{output_str}"
+            ))
+        })?;
 
-    let Some(txid_str) = txid_str_or else {
-        panic!(
-            "Failed to parse txid from Mutinynet faucet response. This likely means the faucet is down or empty. Full response:\n{output:?}"
-        );
-    };
-
-    BtcTxid::from_str(txid_str).expect("Failed to parse 'txid' in Mutinynet faucet response")
+    BtcTxid::from_str(txid_str).context("Failed to parse 'txid' in Mutinynet faucet response")
 }
 
-fn get_test_lava_usd(pubkey: SolanaPubkey) -> SolanaSignature {
+fn get_test_lava_usd(pubkey: SolanaPubkey) -> Result<SolanaSignature> {
     let output = Command::new("curl")
         .arg("-X")
         .arg("POST")
@@ -198,73 +375,151 @@ fn get_test_lava_usd(pubkey: SolanaPubkey) -> SolanaSignature {
         .arg("-d")
         .arg(format!("{{ \"pubkey\": \"{pubkey}\" }}"))
         .output()
-        .expect("Failed to execute curl command");
+        .context("Failed to execute curl command")?;
 
-    let json_output =
-        serde_json::Value::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(LavaTestError::SolanaFaucet(format!(
+            "Lava USD faucet request failed: {stderr}"
+        ))
+        .into());
+    }
+
+    let json_output = serde_json::Value::from_str(&String::from_utf8_lossy(&output.stdout))
+        .context("Failed to parse faucet response as JSON")?;
 
     let signature_str = json_output
         .as_object()
-        .expect("Solana USD faucet response is not a JSON object")
+        .ok_or_else(|| {
+            LavaTestError::SolanaFaucet("Solana USD faucet response is not a JSON object".into())
+        })?
         .get("signature")
-        .expect("Failed to find 'signature' field in Solana USD faucet response")
+        .ok_or_else(|| {
+            LavaTestError::SolanaFaucet(
+                "Failed to find 'signature' field in Solana USD faucet response".into(),
+            )
+        })?
         .as_str()
-        .expect("Failed to parse 'signature' in Solana USD faucet response");
+        .ok_or_else(|| {
+            LavaTestError::SolanaFaucet(
+                "Failed to parse 'signature' in Solana USD faucet response".into(),
+            )
+        })?;
 
     SolanaSignature::from_str(signature_str)
-        .expect("Failed to parse 'signature' in Solana USD faucet response")
+        .context("Failed to parse 'signature' in Solana USD faucet response")
 }
 
-fn install_lava_loans_borrower_cli() {
-    if std::env::consts::OS == "macos" {
-        println!("Installing dependencies for macos");
+// Get the download URL for the current platform
+fn get_download_url() -> Result<&'static str> {
+    match std::env::consts::OS {
+        "macos" => Ok("https://loans-borrower-cli.s3.amazonaws.com/loans-borrower-cli-mac"),
+        "linux" => Ok("https://loans-borrower-cli.s3.amazonaws.com/loans-borrower-cli-linux"),
+        os => {
+            error!("Unsupported OS: {os}");
+            Err(anyhow::anyhow!("Unsupported OS: {}", os))
+        }
+    }
+}
 
-        let _ = Command::new("brew")
-            .arg("install")
-            .arg("libpq")
-            .output()
-            .expect("Failed to execute `brew install libpq` command");
-
-        let _ = Command::new("curl")
-            .arg("-o")
-            .arg("loans-borrower-cli")
-            .arg("https://loans-borrower-cli.s3.amazonaws.com/loans-borrower-cli-mac")
-            .output()
-            .expect("Failed to install loans-borrower-cli");
-    } else if std::env::consts::OS == "linux" {
-        println!("Installing dependencies for Linux");
-
-        let _ = Command::new("sudo")
-            .arg("apt-get")
-            .arg("update")
-            .output()
-            .expect("Failed to execute `sudo apt-get update` command");
-
-        let _ = Command::new("sudo")
-            .arg("apt-get")
-            .arg("install")
-            .arg("libpq-dev")
-            .output()
-            .expect("Failed to execute `sudo install libpq-dev` command");
-
-        let _ = Command::new("curl")
-            .arg("-o")
-            .arg("loans-borrower-cli")
-            .arg("https://loans-borrower-cli.s3.amazonaws.com/loans-borrower-cli-linux")
-            .output()
-            .expect("Failed to install loans-borrower-cli");
-    } else {
-        panic!("Unsupported OS");
+fn install_lava_loans_borrower_cli() -> Result<()> {
+    // Remove existing loans-borrower-cli if it exists.
+    // This ensures we always download and run the latest version.
+    if std::path::Path::new("./loans-borrower-cli").exists() {
+        remove_file("./loans-borrower-cli")?;
     }
 
-    let _ = Command::new("chmod")
+    install_dependencies();
+
+    download_borrower_cli()?;
+
+    make_cli_executable()?;
+
+    info!("loans-borrower-cli installation completed");
+    Ok(())
+}
+
+// Install dependencies for the borrower CLI
+fn install_dependencies() {
+    match std::env::consts::OS {
+        "macos" => install_macos_dependencies(),
+        "linux" => install_linux_dependencies(),
+        _ => {} // No dependencies for other platforms
+    }
+}
+
+// Install macOS dependencies
+fn install_macos_dependencies() {
+    info!("Installing dependencies for macOS");
+    if let Err(e) = Command::new("brew").arg("install").arg("libpq").output() {
+        error!("Failed to execute `brew install libpq` command: {e}");
+    }
+}
+
+// Install Linux dependencies
+fn install_linux_dependencies() {
+    info!("Installing dependencies for Linux");
+    if let Err(e) = Command::new("sudo").arg("apt-get").arg("update").output() {
+        error!("Failed to execute `sudo apt-get update` command: {e}");
+    }
+
+    if let Err(e) = Command::new("sudo")
+        .arg("apt-get")
+        .arg("install")
+        .arg("libpq-dev")
+        .output()
+    {
+        error!("Failed to execute `sudo install libpq-dev` command: {e}");
+    }
+}
+
+// Download the borrower CLI for current platform
+fn download_borrower_cli() -> Result<()> {
+    info!("Downloading loans-borrower-cli...");
+
+    let download_url = get_download_url()?;
+
+    let output = Command::new("curl")
+        .arg("-o")
+        .arg("loans-borrower-cli")
+        .arg(download_url)
+        .output()
+        .context("Failed to download loans-borrower-cli")?;
+
+    if output.status.success() {
+        info!("Downloaded loans-borrower-cli successfully");
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        error!("Failed to download loans-borrower-cli: {stderr}");
+        Err(anyhow::anyhow!(
+            "Failed to download loans-borrower-cli: {}",
+            stderr
+        ))
+    }
+}
+
+fn make_cli_executable() -> Result<()> {
+    let output = Command::new("chmod")
         .arg("+x")
         .arg("./loans-borrower-cli")
         .output()
-        .expect("Failed to execute `chmod +x loans-borrower-cli` command");
+        .context("Failed to execute chmod command")?;
+
+    if output.status.success() {
+        info!("Set executable permissions on loans-borrower-cli");
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        error!("Failed to set executable permissions: {stderr}");
+        Err(anyhow::anyhow!(
+            "Failed to set executable permissions: {}",
+            stderr
+        ))
+    }
 }
 
-fn lava_loans_borrower_cli_borrow(mnemonic: &bip39::Mnemonic) -> Option<String> {
+fn lava_loans_borrower_cli_borrow(mnemonic: &bip39::Mnemonic) -> Result<String> {
     let output = Command::new("./loans-borrower-cli")
         .env("MNEMONIC", mnemonic.to_string())
         .arg("--testnet")
@@ -282,19 +537,24 @@ fn lava_loans_borrower_cli_borrow(mnemonic: &bip39::Mnemonic) -> Option<String> 
         .arg("--finalize")
         .stdout(Stdio::piped())
         .output()
-        .expect("Failed to execute `loans-borrower-cli borrow` command");
+        .context("Failed to execute `loans-borrower-cli borrow init` command")?;
 
     let re = regex::Regex::new(r"New contract ID: ([0-9a-f]{64})\n").unwrap();
 
     // TODO: Figure out why we have to check stderr rather than stdout.
-    re.captures(&String::from_utf8_lossy(&output.stderr))
-        .map(|caps| caps.get(1).map(|m| m.as_str().to_string()))?
+    let Some(contract_id) = re
+        .captures(&String::from_utf8_lossy(&output.stderr))
+        .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
+    else {
+        return Err(anyhow::anyhow!(
+            "Failed to extract contract ID from `loans-borrower-cli borrow init` command"
+        ));
+    };
+
+    Ok(contract_id)
 }
 
-fn lava_loans_borrower_cli_repay(
-    mnemonic: &bip39::Mnemonic,
-    contract_id: &str,
-) -> Result<(), Output> {
+fn lava_loans_borrower_cli_repay(mnemonic: &bip39::Mnemonic, contract_id: &str) -> Result<()> {
     let output = Command::new("./loans-borrower-cli")
         .env("MNEMONIC", mnemonic.to_string())
         .arg("--testnet")
@@ -305,19 +565,23 @@ fn lava_loans_borrower_cli_repay(
         .arg(contract_id)
         .stdout(Stdio::piped())
         .output()
-        .expect("Failed to execute `loans-borrower-cli borrow` command");
+        .context("Failed to execute `loans-borrower-cli borrow` command")?;
 
     if String::from_utf8_lossy(&output.stderr).contains("The collateral has been reclaimed!") {
         Ok(())
     } else {
-        Err(output)
+        // Instead of returning the Output, we'll return a more descriptive error
+        Err(anyhow::anyhow!(
+            "Loan repayment failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ))
     }
 }
 
 fn lava_loans_borrower_cli_get_contract(
     mnemonic: &bip39::Mnemonic,
     contract_id: &str,
-) -> serde_json::Value {
+) -> Result<serde_json::Value> {
     let file_path = format!("./{contract_id}.json");
 
     Command::new("./loans-borrower-cli")
@@ -332,22 +596,31 @@ fn lava_loans_borrower_cli_get_contract(
         .arg(&file_path)
         .stdout(Stdio::piped())
         .output()
-        .expect("Failed to execute `loans-borrower-cli borrow` command");
+        .context("Failed to execute `loans-borrower-cli get-contract` command")?;
 
-    let file = File::open(&file_path).expect("Failed to open file");
+    // Using the ? operator with anyhow's context for better error handling
+    let file =
+        File::open(&file_path).context(format!("Failed to open contract file: {file_path}"))?;
     let reader = BufReader::new(file);
-    let value = serde_json::from_reader(reader).expect("Failed to parse JSON");
-    remove_file(&file_path).unwrap();
+    let value = serde_json::from_reader(reader).context("Failed to parse contract JSON")?;
 
-    value
+    // Still use unwrap here as this cleanup operation failing is not critical to the success of the function
+    // If needed, we could add better error handling here too
+    remove_file(&file_path).unwrap_or_else(|e| {
+        info!("Failed to remove temporary contract file: {e}");
+    });
+
+    Ok(value)
 }
 
 fn derive_keypair(
     root_priv_key: Xpriv,
     network: Network,
-    derivation_path: &DerivationPath,
+    derivation_path: &BtcDerivationPath,
 ) -> (PrivateKey, BtcPublicKey) {
     let secp = Secp256k1::new();
+    // We're using expect here because this function is internal and should never fail
+    // with valid inputs, which we control
     let child_priv_key = root_priv_key
         .derive_priv(&secp, &derivation_path)
         .expect("Failed to derive child private key");
@@ -361,8 +634,10 @@ fn derive_keypair(
 fn send_funds_to_faucet(
     root_priv_key: Xpriv,
     network: Network,
-    derivation_path: &DerivationPath,
-) -> Transaction {
+    derivation_path: &BtcDerivationPath,
+) -> Result<Transaction> {
+    info!("Sending funds back to faucet...");
+
     let (btc_private_key, btc_pubkey) = derive_keypair(root_priv_key, network, derivation_path);
 
     let btc_address = BtcAddress::p2wpkh(&bitcoin::CompressedPublicKey(btc_pubkey.inner), NETWORK);
@@ -371,26 +646,35 @@ fn send_funds_to_faucet(
 
     let mut i = 0;
     let (txo_sum, tx) = loop {
-        let change_info = esplora_client.get_address_stats(&btc_address).unwrap();
-
-        if let Ok(change_txs) = esplora_client.get_address_txs(&btc_address, None) {
-            if let Some(change_tx) = change_txs.first().cloned() {
-                if change_info.chain_stats.funded_txo_sum > 0 {
-                    break (change_info.chain_stats.funded_txo_sum, change_tx);
+        match esplora_client.get_address_stats(&btc_address) {
+            Ok(change_info) => {
+                if let Ok(change_txs) = esplora_client.get_address_txs(&btc_address, None) {
+                    if let Some(change_tx) = change_txs.first().cloned() {
+                        if change_info.chain_stats.funded_txo_sum > 0 {
+                            break (change_info.chain_stats.funded_txo_sum, change_tx);
+                        }
+                    }
                 }
+            }
+            Err(e) => {
+                info!("Failed to get address stats: {e}");
             }
         }
 
         i += 1;
 
-        assert!(
-            i <= MAX_RETRIES,
-            "Failed to retrieve change transaction after {MAX_RETRIES} retries"
-        );
+        if i > MAX_RETRIES {
+            return Err(LavaTestError::FundsReturnFailed(format!(
+                "Failed to retrieve change transaction after {MAX_RETRIES} retries"
+            ))
+            .into());
+        }
+
+        sleep(Duration::from_millis(1000));
     };
 
     let faucet_refund_address = BtcAddress::from_str(FAUCET_REFUND_ADDRESS_STR)
-        .unwrap()
+        .context("Invalid faucet refund address")?
         .assume_checked();
 
     let (vout, _) = tx
@@ -398,7 +682,9 @@ fn send_funds_to_faucet(
         .iter()
         .enumerate()
         .find(|txout| txout.1.scriptpubkey == btc_address.script_pubkey())
-        .unwrap();
+        .ok_or_else(|| {
+            LavaTestError::FundsReturnFailed("Failed to find matching vout in transaction".into())
+        })?;
 
     let mut faucet_funding_tx = Transaction {
         version: Version::TWO,
@@ -406,7 +692,7 @@ fn send_funds_to_faucet(
         input: vec![TxIn {
             previous_output: OutPoint {
                 txid: tx.txid,
-                vout: vout.try_into().unwrap(),
+                vout: vout.try_into().context("Invalid vout index")?,
             },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
@@ -428,8 +714,10 @@ fn send_funds_to_faucet(
             BtcAmount::from_sat(txo_sum),
             EcdsaSighashType::All,
         )
-        .expect("Sighash failed");
-    let message = Message::from_digest_slice(&sighash[..]).expect("Invalid sighash");
+        .context("Sighash failed")?;
+
+    let message = Message::from_digest_slice(&sighash[..]).context("Invalid sighash")?;
+
     let signature = secp.sign_ecdsa(&message, &btc_private_key.inner);
     let mut sig_with_hashtype = signature.serialize_der().to_vec();
     sig_with_hashtype.push(EcdsaSighashType::All as u8);
@@ -438,8 +726,11 @@ fn send_funds_to_faucet(
         .witness
         .push(btc_pubkey.to_bytes());
 
-    // Publish transaction.
-    esplora_client.broadcast(&faucet_funding_tx).unwrap();
+    esplora_client
+        .broadcast(&faucet_funding_tx)
+        .context("Failed to broadcast transaction")?;
 
-    faucet_funding_tx
+    info!("Funds sent back to faucet");
+
+    Ok(faucet_funding_tx)
 }
