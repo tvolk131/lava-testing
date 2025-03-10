@@ -1,5 +1,6 @@
 #![warn(clippy::nursery)]
 #![warn(clippy::pedantic)]
+#![allow(clippy::cognitive_complexity)]
 
 use std::fs::{File, remove_file};
 use std::io::BufReader;
@@ -72,17 +73,14 @@ async fn main() -> Result<()> {
 
     info!("Starting Lava Testing HTTP server");
 
-    // Create a shared flag to track if a test is currently running
-    let test_lock = Arc::new(Mutex::new(()));
+    let test_lock: TestLock = Arc::new(Mutex::new(()));
 
-    // Build our application with a route
     let app = Router::new()
         .route("/run-test", get(run_test_handler))
         .route("/health", get(health_check))
         .layer(TraceLayer::new_for_http())
         .with_state(test_lock);
 
-    // Run our app
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
     info!("Listening on {addr}");
 
@@ -97,8 +95,9 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-// Lock to be shared between handlers.
-type AppState = Arc<Mutex<()>>;
+/// Lock to be shared between handlers, to
+/// ensure only one test can run at a time.
+type TestLock = Arc<Mutex<()>>;
 
 #[axum::debug_handler]
 async fn health_check() -> StatusCode {
@@ -106,8 +105,8 @@ async fn health_check() -> StatusCode {
 }
 
 #[axum::debug_handler]
-async fn run_test_handler(State(state): State<AppState>) -> (StatusCode, String) {
-    let Ok(test_lock_guard) = state.try_lock() else {
+async fn run_test_handler(State(test_lock): State<TestLock>) -> (StatusCode, String) {
+    let Ok(test_lock_guard) = test_lock.try_lock() else {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             "A test is already running. Please try again later.".to_string(),
@@ -124,11 +123,11 @@ async fn run_test_handler(State(state): State<AppState>) -> (StatusCode, String)
             StatusCode::OK,
             format!("Test passed successfully! Contract ID: {contract_id}"),
         ),
-        Ok(Err(err)) => {
-            error!("Test error: {err:?}");
+        Ok(Err(test_err)) => {
+            error!("Test error: {test_err:?}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Test failed: {err}"),
+                format!("Test failed: {test_err}"),
             )
         }
         Err(join_err) => {
@@ -185,7 +184,6 @@ fn run_test() -> Result<String> {
 
     info!("Contract ID: {contract_id}");
 
-    // Return remaining funds to faucet.
     send_funds_to_faucet(root_priv_key, NETWORK, &btc_change_derivation_path)
         .context("Failed to send funds back to faucet")?;
 
@@ -404,7 +402,6 @@ fn get_test_lava_usd(pubkey: SolanaPubkey) -> Result<SolanaSignature> {
         .context("Failed to parse 'signature' in Solana USD faucet response")
 }
 
-// Get the download URL for the current platform
 fn get_download_url() -> Result<&'static str> {
     match std::env::consts::OS {
         "macos" => Ok("https://loans-borrower-cli.s3.amazonaws.com/loans-borrower-cli-mac"),
@@ -433,7 +430,6 @@ fn install_lava_loans_borrower_cli() -> Result<()> {
     Ok(())
 }
 
-// Install dependencies for the borrower CLI
 fn install_dependencies() {
     match std::env::consts::OS {
         "macos" => install_macos_dependencies(),
@@ -442,7 +438,6 @@ fn install_dependencies() {
     }
 }
 
-// Install macOS dependencies
 fn install_macos_dependencies() {
     info!("Installing dependencies for macOS");
     if let Err(e) = Command::new("brew").arg("install").arg("libpq").output() {
@@ -450,7 +445,6 @@ fn install_macos_dependencies() {
     }
 }
 
-// Install Linux dependencies
 fn install_linux_dependencies() {
     info!("Installing dependencies for Linux");
     if let Err(e) = Command::new("sudo").arg("apt-get").arg("update").output() {
@@ -467,7 +461,6 @@ fn install_linux_dependencies() {
     }
 }
 
-// Download the borrower CLI for current platform
 fn download_borrower_cli() -> Result<()> {
     info!("Downloading loans-borrower-cli...");
 
