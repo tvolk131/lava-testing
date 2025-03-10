@@ -124,20 +124,20 @@ async fn run_test_handler(State(state): State<AppState>) -> (StatusCode, String)
     // Run test in a separate blocking task to avoid blocking the HTTP server.
     let result = tokio::task::spawn_blocking(run_test).await;
 
-    let (status, message) = match result {
-        Ok(test_result) => match test_result {
-            Ok(contract_id) => (
-                StatusCode::OK,
-                format!("Test passed successfully! Contract ID: {contract_id}"),
-            ),
-            Err(err) => {
-                error!("Test error: {err:?}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Test failed: {err}"),
-                )
-            }
-        },
+    drop(test_lock_guard);
+
+    match result {
+        Ok(Ok(contract_id)) => (
+            StatusCode::OK,
+            format!("Test passed successfully! Contract ID: {contract_id}"),
+        ),
+        Ok(Err(err)) => {
+            error!("Test error: {err:?}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Test failed: {err}"),
+            )
+        }
         Err(join_err) => {
             error!("Test panic: {join_err}");
             (
@@ -145,11 +145,7 @@ async fn run_test_handler(State(state): State<AppState>) -> (StatusCode, String)
                 format!("Test task panicked: {join_err}"),
             )
         }
-    };
-
-    drop(test_lock_guard);
-
-    (status, message)
+    }
 }
 
 fn run_test() -> Result<String> {
