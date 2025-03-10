@@ -68,16 +68,9 @@ const MAX_RETRIES: i32 = 10;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing
     tracing_subscriber::fmt::init();
 
     info!("Starting Lava Testing HTTP server");
-
-    // Check if CLI tool is installed
-    if let Err(e) = install_lava_loans_borrower_cli() {
-        error!("Failed to install LAVA loans borrower CLI: {e}");
-        return Err(e);
-    }
 
     // Create a shared flag to track if a test is currently running
     let test_lock = Arc::new(Mutex::new(()));
@@ -150,6 +143,11 @@ async fn run_test_handler(State(state): State<AppState>) -> (StatusCode, String)
 
 fn run_test() -> Result<String> {
     info!("Starting Lava test run...");
+
+    if let Err(e) = install_lava_loans_borrower_cli() {
+        error!("Failed to install LAVA loans borrower CLI: {e}");
+        return Err(e);
+    }
 
     let (mnemonic, root_priv_key) = initialize_wallet()?;
 
